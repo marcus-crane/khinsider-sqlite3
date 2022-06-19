@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/gocolly/colly/v2"
@@ -20,8 +21,9 @@ type Album struct {
 	Runtime           string     `json:"runtime"`
 	Type              string     `json:"type"`
 	FileCount         int        `json:"file_count"`
-	FilesizeMP3Bytes  int        `json:filesize_mp3_bytes`
-	FilesizeFlacBytes int        `json:"filesize_flac_bytes`
+	FilesizeMP3Bytes  int        `json:"filesize_mp3_bytes"`
+	FilesizeFlacBytes int        `json:"filesize_flac_bytes"`
+	Tracks            []Track    `json:"tracks"`
 	Platforms         []Platform `gorm:"many2many:album_platforms;" json:"platforms"`
 	Images            []Image    `gorm:"many2many:album_images;" json:"images"`
 }
@@ -36,6 +38,7 @@ type Image struct {
 
 type Track struct {
 	gorm.Model
+	AlbumID           string `json:"album_id"`
 	URL               string `json:"url"`
 	TrackNumber       int    `json:"track_number"`
 	DiscNumber        int    `json:"disc_number"`
@@ -43,14 +46,13 @@ type Track struct {
 	Runtime           string `json:"runtime"`
 	MP3Available      bool   `json:"mp3_available"`
 	FlacAvailable     bool   `json:"flac_available"`
-	FilesizeMP3Bytes  int    `json:"filesize_mp3_bytes"`
-	FilesizeFlacBytes int    `json:"filesize_flac_bytes`
+	FilesizeMP3Bytes  string `json:"filesize_mp3_bytes"`
+	FilesizeFlacBytes string `json:"filesize_flac_bytes"`
 }
 
 var (
 	BASE_URL   = "https://downloads.khinsider.com"
 	FIRST_PAGE = "https://downloads.khinsider.com/game-soundtracks?page=1"
-	db         *gorm.DB
 )
 
 func main() {
@@ -63,7 +65,7 @@ func main() {
 	db.AutoMigrate(Track{})
 
 	// updatePlatforms(db)
-	// updateAlbums(db)
+	updateAlbums(db)
 	updateAlbumMetadata(db)
 }
 
@@ -78,7 +80,7 @@ func contains(s []string, sub string) bool {
 
 func updateAlbumMetadata(db *gorm.DB) {
 	albums := []Album{}
-	db.Find(&albums)
+	db.Select("url").Find(&albums)
 
 	c := colly.NewCollector()
 
@@ -87,8 +89,62 @@ func updateAlbumMetadata(db *gorm.DB) {
 		&queue.InMemoryQueueStorage{MaxSize: 10000},
 	)
 
-	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
-		fmt.Print(e.Text)
+	tableHeaders := map[int]string{}
+
+	c.OnHTML("table#songlist tbody tr", func(e *colly.HTMLElement) {
+		album := Album{}
+		fmt.Println(e.Request.URL.Path)
+		albumID := strings.ReplaceAll(e.Request.URL.Path, "/game-soundtracks/album/", "")
+		fmt.Println(albumID)
+		db.First(&album, "id = ?", albumID)
+		if e.Index == 0 {
+			e.ForEach("th", func(index int, e *colly.HTMLElement) {
+				tableHeaders[index] = strings.TrimSpace(e.Text)
+			})
+		}
+		track := Track{}
+		e.ForEach("td", func(index int, e *colly.HTMLElement) {
+			if e.Index == 0 {
+				return
+			}
+			if tableHeaders[e.Index] == "CD" {
+				discNum, err := strconv.Atoi(strings.TrimSpace(e.Text))
+				if err != nil {
+					fmt.Println("failed to convert disc num")
+				} else {
+					track.DiscNumber = discNum
+				}
+			}
+			if e.Attr("class") == "clickable-row" && e.Attr("align") == "right" {
+				track.Runtime = e.Text
+			}
+			if tableHeaders[e.Index] == "#" {
+				trackNum, err := strconv.Atoi(strings.ReplaceAll(strings.TrimSpace(e.Text), ".", ""))
+				if err != nil {
+					fmt.Println("failed to convert track num")
+				} else {
+					track.TrackNumber = trackNum
+				}
+			}
+			if tableHeaders[e.Index] == "Song Name" {
+				track.Title = strings.TrimSpace(e.Text)
+			}
+			if tableHeaders[e.Index] == "MP3" {
+				link := e.ChildAttr("a", "href")
+				track.URL = fmt.Sprintf("%s%s", BASE_URL, link)
+				track.MP3Available = true
+				track.FilesizeMP3Bytes = e.Text
+			}
+			if tableHeaders[e.Index] == "FLAC" {
+				link := e.ChildAttr("a", "href")
+				track.URL = fmt.Sprintf("%s%s", BASE_URL, link)
+				track.FlacAvailable = true
+				track.FilesizeFlacBytes = e.Text
+			}
+		})
+		album.Tracks = append(album.Tracks, track)
+		fmt.Println(album)
+		db.Save(&album)
 	})
 
 	for _, album := range albums {
